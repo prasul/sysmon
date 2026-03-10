@@ -40,6 +40,10 @@ MYSQL_QPS_STATE="/tmp/mysql_qps.state"
 touch "$MYSQL_QPS_STATE"
 PHPFPM_STATUS_URL="http://127.0.0.1/status"
 
+ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
+ABUSEIPDB_CACHE="/tmp/.ipcache_${$}"
+touch "$ABUSEIPDB_CACHE" && chmod 600 "$ABUSEIPDB_CACHE"
+
 # ══════════════════════════════════════════════════════
 #  LAYOUT CONFIG — all column math in one place
 #  Change numbers here and everything adjusts globally
@@ -1188,6 +1192,7 @@ trap '
     echo ""
     generate_html_report
     rm -f "$FRAME"
+    rm -f "$ABUSEIPDB_CACHE"
     exit 0
 ' INT
 
@@ -1618,9 +1623,10 @@ while true; do
     rm -f "$C1" "$C2"
     hline '─' "$DGRAY"
 
-    # ════════════════════════════════════════════
-    #  BLOCK 5: LIVE URL HITS — FULL WIDTH
-    # ════════════════════════════════════════════
+
+# ════════════════════════════════════════════════
+#  BLOCK 5: LIVE URL HITS — FULL WIDTH
+# ════════════════════════════════════════════════
     {
         LIVE_URL_STATE="/tmp/live_url_ip.state"
         NEW_LIVE_STATE=$(mktemp)
@@ -1628,11 +1634,14 @@ while true; do
 
         COL_LV_HITS=6
         COL_LV_DELTA=10
+        COL_LV_CC=4
+        COL_LV_ABUSE=6
+        COL_LV_ISP=24
         COL_LV_IP=18
         COL_LV_DOM=20
         COL_LV_METHOD=6
         COL_LV_STATUS=6
-        COL_LV_URL=$(( TW - COL_LV_HITS - COL_LV_DELTA - COL_LV_IP - COL_LV_DOM - COL_LV_METHOD - COL_LV_STATUS - 16 ))
+        COL_LV_URL=$(( TW - COL_LV_HITS - COL_LV_DELTA - COL_LV_CC - COL_LV_ABUSE - COL_LV_ISP - COL_LV_IP - COL_LV_DOM - COL_LV_METHOD - COL_LV_STATUS - 26 ))
         [ "$COL_LV_URL" -lt 24 ] && COL_LV_URL=24
 
         printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC  ${DGRAY}(current minute window: %s)${R}\n" "$CUR_MIN"
@@ -1650,21 +1659,124 @@ while true; do
                 }' >> "$NEW_LIVE_STATE"
         done
 
+        # ── IP lookup + cache helpers ─────────────────────────────────────
+        #
+        # ABUSEIPDB_CACHE is a flat file: one "ip|score|cc" line per IP.
+        # It lives in /tmp with a PID-unique name and is deleted on EXIT.
+        #
+        # Why a file and not an associative array:
+        #   while-read loops run in subshells — they cannot write back to
+        #   parent-scope variables, so declare -A would lose every write.
+        #   A file is visible to all subshells and persists across loops.
+        #
+        # All API calls happen in _abuseipdb_prefetch (called once per
+        # refresh, before any while-read loop). Both loops below only
+        # ever grep the cache file — zero additional API calls.
+
+        # ── IP enrichment — queries AbuseIPDB (score) + ip-api.com (geo/ISP) ──
+        #
+        # Cache file format:  ip|score|cc|isp
+        #   score  — AbuseIPDB confidence score 0-100, or "-" if no key / error
+        #   cc     — ISO country code e.g. "CN", "US", or "--"
+        #   isp    — ISP / org name from ip-api.com, or "-"
+        #
+        # ip-api.com is free, no key needed, 45 req/min limit.
+        # Both calls happen only once per unique IP per script run.
+        # All subsequent lookups are pure grep against the cache file.
+        _ip_enrich() {
+            local ip="$1"
+
+            # Return cached result immediately
+            local cached
+            cached=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+            if [ -n "$cached" ]; then
+                echo "$cached"; return
+            fi
+
+            # Skip RFC-1918 / loopback — not useful to query
+            local oct1 oct2
+            oct1=$(echo "$ip" | cut -d. -f1)
+            oct2=$(echo "$ip" | cut -d. -f2)
+            case "${oct1}.${oct2}" in
+                10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*|0.*)
+                    echo "${ip}|-|--|−" >> "$ABUSEIPDB_CACHE"
+                    echo "${ip}|-|--|−"; return ;;
+            esac
+
+            # ── 1. AbuseIPDB — abuse confidence score ─────────────────────
+            local score="-"
+            if [ -n "$ABUSEIPDB_KEY" ]; then
+                local abuse_raw
+                abuse_raw=$(curl -sS --max-time 3 -G "https://api.abuseipdb.com/api/v2/check" \
+                    --data-urlencode "ipAddress=${ip}" \
+                    -d "maxAgeInDays=90" \
+                    -H "Key: ${ABUSEIPDB_KEY}" \
+                    -H "Accept: application/json" 2>/dev/null)
+                score=$(echo "$abuse_raw" | grep -oP '"abuseConfidenceScore"\s*:\s*\K[0-9]+')
+                score="${score:--}"
+            fi
+
+            # ── 2. ip-api.com — country code + ISP (free, no key needed) ──
+            local geo_raw cc isp
+            geo_raw=$(curl -sS --max-time 3 \
+                "http://ip-api.com/json/${ip}?fields=countryCode,isp,org" 2>/dev/null)
+            cc=$(echo  "$geo_raw" | grep -oP '"countryCode"\s*:\s*"\K[^"]+')
+            isp=$(echo "$geo_raw" | grep -oP '"isp"\s*:\s*"\K[^"]+')
+            # Fall back to org field if isp is empty
+            [ -z "$isp" ] && isp=$(echo "$geo_raw" | grep -oP '"org"\s*:\s*"\K[^"]+')
+            cc="${cc:---}"
+            isp="${isp:--}"
+            # Truncate ISP name to 24 chars so it fits the column
+            [ "${#isp}" -gt 24 ] && isp="${isp:0:23}…"
+
+            local result="${ip}|${score}|${cc}|${isp}"
+            echo "$result" >> "$ABUSEIPDB_CACHE"
+            echo "$result"
+        }
+
+        # Colour helper — safe to call from any subshell (read-only)
+        _abuse_colour() {
+            local score="$1"
+            if [[ "$score" =~ ^[0-9]+$ ]]; then
+                if   [ "$score" -ge 75 ]; then printf '%s' "${RED}${BOLD}"
+                elif [ "$score" -ge 25 ]; then printf '%s' "${ORANGE}"
+                else                           printf '%s' "${GREEN_S}"
+                fi
+            else
+                printf '%s' "${DGRAY}"
+            fi
+        }
+
+        # ── Prefetch: resolve every unique IP before any while-read loop ──
+        # This is the ONLY place curl is ever called. Subsequent lookups
+        # in both loops below are pure grep against the cache file.
+        if [ -s "$NEW_LIVE_STATE" ]; then
+            while read -r ip; do
+                _ip_enrich "$ip" > /dev/null
+            done < <(awk '{print $2}' "$NEW_LIVE_STATE" | sort -u)
+        fi
+
         if [ -s "$NEW_LIVE_STATE" ]; then
 
             LIVE_VEL_STATE="/tmp/live_vel_domip.state"
 
             COL_VS_HITS=6
-            COL_VS_DOM=24
+            COL_VS_DOM=22
             COL_VS_IP=18
             COL_VS_DELTA=12
+            COL_VS_CC=4
+            COL_VS_ABUSE=6
+            COL_VS_ISP=24
 
-            printf "\n  ${CYAN}${DIM}▸  TOP IPs THIS MINUTE${R}  ${DGRAY}domain · ip · hits · Δ since last refresh${R}\n"
-            printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_DOM}s  %-${COL_VS_IP}s  %s${R}\n" \
-                "HITS" "DOMAIN" "IP" "Δ CHANGE"
-            printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_DOM}s  %-${COL_VS_IP}s  %s${R}\n" \
-                "──────" "$(printf '─%.0s' $(seq 1 $COL_VS_DOM))" \
-                "$(printf '─%.0s' $(seq 1 $COL_VS_IP))" "────────────"
+            printf "\n  ${CYAN}${DIM}▸  TOP IPs THIS MINUTE${R}  ${DGRAY}domain · ip · country · abuse score · hits · Δ${R}\n"
+            printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_CC}s  %-${COL_VS_ABUSE}s  %-${COL_VS_IP}s  %-${COL_VS_ISP}s  %-${COL_VS_DOM}s  %s${R}\n" \
+                "HITS" "CC" "ABUSE" "IP" "ISP" "DOMAIN" "Δ CHANGE"
+            printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_CC}s  %-${COL_VS_ABUSE}s  %-${COL_VS_IP}s  %-${COL_VS_ISP}s  %-${COL_VS_DOM}s  %s${R}\n" \
+                "──────" "────" "──────" \
+                "$(printf '─%.0s' $(seq 1 $COL_VS_IP))" \
+                "$(printf '─%.0s' $(seq 1 $COL_VS_ISP))" \
+                "$(printf '─%.0s' $(seq 1 $COL_VS_DOM))" \
+                "────────────"
 
             awk '{print $1, $2}' "$NEW_LIVE_STATE" | \
             sort | uniq -c | sort -nr | head -10 | \
@@ -1672,8 +1784,15 @@ while true; do
                 [ -z "$ip" ] && continue
                 count=$(( ${count:-0} + 0 ))
 
+                # Pure cache read — no API call possible here
+                entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+                lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
+                lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
+                lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+                acol=$(_abuse_colour "$lscore")
+
                 state_key="${dom}|${ip}"
-                prev=$(grep "^${state_key}=" "$LIVE_VEL_STATE" 2>/dev/null | cut -d'=' -f2)
+                prev=$(grep "^${state_key}=" "$LIVE_VEL_STATE" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
                 prev=$(( ${prev:-0} + 0 ))
 
                 if [ "$prev" -eq 0 ]; then
@@ -1689,21 +1808,25 @@ while true; do
 
                 echo "${state_key}=${count}" >> "${LIVE_VEL_STATE}.new"
 
-                printf "  ${ORANGE}%-${COL_VS_HITS}s${R}  " "$count"
-                printf "${GREEN_S}%-${COL_VS_DOM}.${COL_VS_DOM}s${R}  " "$dom"
+                printf "  ${ORANGE}%-${COL_VS_HITS}s${R}  "             "$count"
+                printf "${GRAY}%-${COL_VS_CC}s${R}  "                   "$lcc"
+                printf "${acol}%-${COL_VS_ABUSE}s${R}  "                "$lscore"
                 printf "${CYAN_S}%-${COL_VS_IP}.${COL_VS_IP}s${R}  "   "$ip"
+                printf "${DIM}%-${COL_VS_ISP}.${COL_VS_ISP}s${R}  "    "$lisp"
+                printf "${GREEN_S}%-${COL_VS_DOM}.${COL_VS_DOM}s${R}  " "$dom"
                 printf "%b\n" "$delta"
             done
 
             mv "${LIVE_VEL_STATE}.new" "$LIVE_VEL_STATE" 2>/dev/null
 
-            printf "\n  ${CYAN}${DIM}▸  URL BREAKDOWN${R}  ${DGRAY}url · ip · method · status · Δ${R}\n"
-            printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_DOM}s  %-${COL_LV_IP}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
-                "HITS" "Δ CHANGE" "DOMAIN" "IP" "METH" "URL" "ST"
-            printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_DOM}s  %-${COL_LV_IP}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
-                "──────" "──────────" \
-                "$(printf '─%.0s' $(seq 1 $COL_LV_DOM))" \
+            printf "\n  ${CYAN}${DIM}▸  URL BREAKDOWN${R}  ${DGRAY}url · ip · cc · abuse · method · status · Δ${R}\n"
+            printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_CC}s  %-${COL_LV_ABUSE}s  %-${COL_LV_ISP}s  %-${COL_LV_IP}s  %-${COL_LV_DOM}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
+                "HITS" "Δ CHANGE" "CC" "ABUSE" "ISP" "IP" "DOMAIN" "METH" "URL" "ST"
+            printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_CC}s  %-${COL_LV_ABUSE}s  %-${COL_LV_ISP}s  %-${COL_LV_IP}s  %-${COL_LV_DOM}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
+                "──────" "──────────" "────" "──────" \
+                "$(printf '─%.0s' $(seq 1 $COL_LV_ISP))" \
                 "$(printf '─%.0s' $(seq 1 $COL_LV_IP))" \
+                "$(printf '─%.0s' $(seq 1 $COL_LV_DOM))" \
                 "──────" \
                 "$(printf '─%.0s' $(seq 1 $COL_LV_URL))" \
                 "──"
@@ -1723,8 +1846,15 @@ while true; do
                 [ -z "$url" ] && continue
                 hits=$(( ${hits:-0} + 0 ))
 
+                # Pure cache read — no API call possible here
+                entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+                lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
+                lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
+                lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+                acol=$(_abuse_colour "$lscore")
+
                 state_key="${dom}|${ip}|${url}"
-                prev=$(grep "^${state_key}=" "$LIVE_URL_STATE" 2>/dev/null | cut -d'=' -f2)
+                prev=$(grep "^${state_key}=" "$LIVE_URL_STATE" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
                 prev=$(( ${prev:-0} + 0 ))
 
                 if [ "$prev" -eq 0 ]; then
@@ -1749,20 +1879,23 @@ while true; do
                     5) sc="${RED}${BOLD}" ;;
                     4) sc="${ORANGE}" ;;
                     3) sc="${YELLOW}" ;;
-                    *)  sc="${GREEN_S}" ;;
+                    *) sc="${GREEN_S}" ;;
                 esac
 
                 if [ "${#url}" -gt "$COL_LV_URL" ]; then
                     url="${url:0:$(( COL_LV_URL - 1 ))}…"
                 fi
 
-                printf "  ${ORANGE}%-${COL_LV_HITS}s${R}  " "$hits"
-                printf "%-${COL_LV_DELTA}b  "               "$delta"
-                printf "${GREEN_S}%-${COL_LV_DOM}.${COL_LV_DOM}s${R}  " "$dom"
+                printf "  ${ORANGE}%-${COL_LV_HITS}s${R}  "             "$hits"
+                printf "%-${COL_LV_DELTA}b  "                            "$delta"
+                printf "${GRAY}%-${COL_LV_CC}s${R}  "                   "$lcc"
+                printf "${acol}%-${COL_LV_ABUSE}s${R}  "                "$lscore"
+                printf "${DIM}%-${COL_LV_ISP}.${COL_LV_ISP}s${R}  "    "$lisp"
                 printf "${CYAN_S}%-${COL_LV_IP}.${COL_LV_IP}s${R}  "   "$ip"
-                printf "${mc}%-${COL_LV_METHOD}s${R}  "                 "$meth"
-                printf "${YELLOW}%-${COL_LV_URL}s${R}  "               "$url"
-                printf "${sc}%s${R}\n"                                   "$status"
+                printf "${GREEN_S}%-${COL_LV_DOM}.${COL_LV_DOM}s${R}  " "$dom"
+                printf "${mc}%-${COL_LV_METHOD}s${R}  "                  "$meth"
+                printf "${YELLOW}%-${COL_LV_URL}s${R}  "                "$url"
+                printf "${sc}%s${R}\n"                                    "$status"
 
             done
 
@@ -1773,61 +1906,6 @@ while true; do
         fi
 
         rm -f "$NEW_LIVE_STATE"
-    }
-    hline '─' "$DGRAY"
-
-    # ════════════════════════════════════════════
-    #  BLOCK 6: MYSQL ACTIVE PROCESSES — FULL WIDTH
-    # ════════════════════════════════════════════
-    {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
-        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
-            "ID" "DATABASE" "TIME" "STATE" "QUERY PREVIEW"
-        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
-            "────────" "──────────────────────" "──────" "────────────────" "$(printf '─%.0s' $(seq 1 $COL_MYSQL_QUERY))"
-
-        mysql_out=$(mysql --batch --silent -e "
-            SELECT
-                ID,
-                IFNULL(DB, 'system')    AS DB,
-                TIME,
-                IFNULL(STATE, '')       AS STATE,
-                IFNULL(INFO, '')        AS INFO
-            FROM information_schema.PROCESSLIST
-            WHERE COMMAND != 'Sleep'
-              AND INFO IS NOT NULL
-            ORDER BY TIME DESC
-            LIMIT 8;" 2>/dev/null)
-
-        if [ -z "$mysql_out" ]; then
-            printf "  ${GRAY}${DIM}(no active queries)${R}\n"
-        else
-            while IFS=$'\t' read -r id db time state query; do
-                [[ "$id" == "ID" ]] && continue
-                [ -z "$id" ]        && continue
-
-                time=$(( ${time:-0} + 0 ))
-                if [ "$time" -ge 5 ]; then
-                    tc="\033[38;5;196m"
-                else
-                    tc="\033[38;5;214m"
-                fi
-
-                printf "  \033[38;5;244m%-${COL_MYSQL_ID}s\033[0m" "$id"
-                printf " \033[38;5;82m%-${COL_MYSQL_DB}.${COL_MYSQL_DB}s\033[0m" "$db"
-                printf " ${tc}%-${COL_MYSQL_TIME}s\033[0m" "${time}s"
-                printf " \033[38;5;45m%-${COL_MYSQL_STATE}.${COL_MYSQL_STATE}s\033[0m\n" "$state"
-
-                clean_query=$(echo "$query" | tr '\n\t' '  ' | tr -s ' ')
-                echo "$clean_query" | fold -s -w "$COL_MYSQL_QUERY" | \
-                while IFS= read -r qline; do
-                    printf "  \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$qline"
-                done
-
-                printf "  \033[38;5;237m%s\033[0m\n" \
-                    "$(printf '╌%.0s' $(seq 1 $(( TW - 4 ))))"
-            done <<< "$mysql_out"
-        fi
     }
     hline '─' "$DGRAY"
 
